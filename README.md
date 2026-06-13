@@ -38,6 +38,7 @@ Prerequisites:
   1. **Persistence Layer:** Uses **Turso (libSQL)** to store user search preferences (`UserPreferences`) and track processed job IDs (`SentJobs`). This ensures the system is state-aware and   prevents duplicate notifications.
   2. **Execution Engine:** The system employs a non-blocking `child_process` execution model. When a user triggers a search, the Node.js backend offloads the heavy lifting to the Python       `worker.py` script, allowing for immediate frontend responsiveness.
   3. **Smart Filtering:** The worker calculates a rolling date window, ensuring that all job results are fresh and relevant while respecting the user's defined timeframe.
+  4. **The system uses a polling-based architecture where the Node.js backend writes search parameters to a Turso database, and the Python worker polls for pending jobs to execute them           asynchronously.**
 
 ### Backend (port 5000)
 
@@ -65,6 +66,10 @@ Open [http://localhost:3000](http://localhost:3000), fill the search panel, and 
 The worker script runs the scraping and AI analysis logic:
   pip install requests beautifulsoup4 openai aiohttp
   python worker.py  
+  (The worker is designed to be run as a standalone background process. It automatically polls the user_preferences table for new pending jobs)
+
+### Workflow Blueprint:
+The project includes a workflow.json file detailing the end-to-end automation pipeline, from frontend input to Discord notification delivery.
 
 ## API contract
 
@@ -76,28 +81,16 @@ The worker script runs the scraping and AI analysis logic:
 | `region` | string | `South` \| `Center` \| `North` |
 | `jobScope` | string | `Full-time` \| `Part-time` \| `Student` \| `Internship` \| `Temporary` |
 | `jobTitle` | string | Target role title |
-| `maxDatePublished` | string (optional) | ISO date — influences mock listing dates |
+| `maxDatePublished` | string (optional) | ISO date |
 
 **Response** — `200` JSON
 
 ```json
 {
-  "mockJobs": [
-    {
-      "id": "string",
-      "title": "string",
-      "company": "string",
-      "datePublished": "YYYY-MM-DD",
-      "jobScope": "string",
-      "location": "string",
-      "matchPercentage": 94,
-      "coverLetterUrl": "https://example.com/..."
-    }
-  ]
+  "message": "Search initiated",
+  "status": "pending"
 }
 ```
-
-`mockJobs` is sorted by `matchPercentage` descending (highest first).
 
 ## Security Notice
   This project uses several API keys. To ensure security, sensitive information is managed via a .env file:
