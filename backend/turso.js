@@ -65,6 +65,95 @@ async function saveUserPreferences({
   return { searchJobId, status: 'pending' };
 }
 
+const LATEST_PREFERENCE_ID = 'latest';
+
+/**
+ * Persist the user's most recent search filters for automated worker runs (GitHub Actions).
+ * Also mirrors into user_preferences so found_jobs FK stays valid.
+ */
+async function saveLatestUserPreferences({
+  regions,
+  jobScopes,
+  jobTitles,
+  maxDatePublished,
+  resumeText,
+  resumeFileName,
+  searchMode,
+  jsearchQuery,
+}) {
+  const db = getTursoClient();
+  const args = [
+    JSON.stringify(regions),
+    JSON.stringify(jobScopes),
+    JSON.stringify(jobTitles),
+    maxDatePublished?.trim() || null,
+    resumeText || '',
+    resumeFileName || null,
+    searchMode,
+    jsearchQuery || '',
+  ];
+
+  await db.execute({
+    sql: `
+      INSERT INTO UserPreferences (
+        id,
+        regions,
+        job_scopes,
+        job_titles,
+        max_date_published,
+        resume_text,
+        resume_file_name,
+        search_mode,
+        jsearch_query,
+        updated_at
+      ) VALUES ('latest', ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        regions = excluded.regions,
+        job_scopes = excluded.job_scopes,
+        job_titles = excluded.job_titles,
+        max_date_published = excluded.max_date_published,
+        resume_text = excluded.resume_text,
+        resume_file_name = excluded.resume_file_name,
+        search_mode = excluded.search_mode,
+        jsearch_query = excluded.jsearch_query,
+        updated_at = datetime('now')
+    `,
+    args,
+  });
+
+  await db.execute({
+    sql: `
+      INSERT INTO user_preferences (
+        id,
+        regions,
+        job_scopes,
+        job_titles,
+        max_date_published,
+        resume_text,
+        resume_file_name,
+        search_mode,
+        jsearch_query,
+        status,
+        updated_at
+      ) VALUES ('latest', ?, ?, ?, ?, ?, ?, ?, ?, 'saved', datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        regions = excluded.regions,
+        job_scopes = excluded.job_scopes,
+        job_titles = excluded.job_titles,
+        max_date_published = excluded.max_date_published,
+        resume_text = excluded.resume_text,
+        resume_file_name = excluded.resume_file_name,
+        search_mode = excluded.search_mode,
+        jsearch_query = excluded.jsearch_query,
+        status = 'saved',
+        updated_at = datetime('now')
+    `,
+    args,
+  });
+
+  return { preferenceId: LATEST_PREFERENCE_ID };
+}
+
 async function getFoundJobsByPreferenceId(preferenceId) {
   const db = getTursoClient();
   const result = await db.execute({
@@ -101,5 +190,7 @@ async function getFoundJobsByPreferenceId(preferenceId) {
 module.exports = {
   getTursoClient,
   saveUserPreferences,
+  saveLatestUserPreferences,
   getFoundJobsByPreferenceId,
+  LATEST_PREFERENCE_ID,
 };

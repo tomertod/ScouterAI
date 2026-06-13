@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import './App.css';
+import ScoutCharacter from './ScoutCharacter';
 
 const API_BASE_URL = 'http://localhost:5001';
 const API_SCOUT_URL = `${API_BASE_URL}/api/scout`;
@@ -13,26 +14,33 @@ const PRESET_JOB_TITLES = [
   'Manual QA Engineer',
   'Java Developer',
   'Python Developer',
+  'Junior Python Developer',
   'C++ Developer',
   'Fullstack Developer',
   'Backend Developer',
+  'Junior Backend Developer',
   'Frontend Developer',
   'Node.js Developer',
   'Software Engineering Student',
+  'Student Software Developer',
   'Junior Software Engineer',
   'DevOps Engineer',
   'Data Analyst',
+  'Data & AI Intern',
+  'QA Student',
+  'Cloud Computing Intern',
+  'Mobile Developer Student',
 ];
 
 const REGIONS = [
-  { label: 'צפון', value: 'north' },
-  { label: 'חיפה והקריות', value: 'haifa_krayot' },
-  { label: 'השרון', value: 'sharon' },
-  { label: 'מרכז', value: 'center' },
-  { label: 'ירושלים והסביבה', value: 'jerusalem' },
-  { label: 'דרום', value: 'south' },
-  { label: 'ערבה', value: 'arava' },
-  { label: 'אילת', value: 'eilat' },
+  { label: 'North', value: 'north' },
+  { label: 'Haifa & Krayot', value: 'haifa_krayot' },
+  { label: 'Sharon', value: 'sharon' },
+  { label: 'Center', value: 'center' },
+  { label: 'Jerusalem Area', value: 'jerusalem' },
+  { label: 'South', value: 'south' },
+  { label: 'Arava', value: 'arava' },
+  { label: 'Eilat', value: 'eilat' },
 ];
 const JOB_SCOPES = [
   'Full-time',
@@ -47,6 +55,12 @@ const initialForm = {
   jobScope: ['Full-time'],
   maxDatePublished: '',
 };
+
+function getMatchPercentageColor(percentage) {
+  if (percentage >= 70) return '#2ECC40';
+  if (percentage >= 50) return '#FF851B';
+  return '#FF4136';
+}
 
 function normalizeJobsFromResponse(data) {
   const raw = data?.jobs ?? data?.mockJobs ?? [];
@@ -374,8 +388,10 @@ function App() {
 
   return (
     <div className="app">
+      <ScoutCharacter />
+
       <header className="app-header">
-        <h1>ScouterAI</h1>
+        <h1 className="app-title">ScouterAI</h1>
         <p>AI-powered job search — tracer bullet</p>
       </header>
 
@@ -399,8 +415,8 @@ function App() {
             </label>
 
             <fieldset className="field checkbox-group">
-              <legend>אזור</legend>
-              <p className="field-hint">בחר אחד או יותר. השאר ריק לכל הארץ.</p>
+              <legend>Region</legend>
+              <p className="field-hint">Select one or more. Leave empty to search all of Israel.</p>
               <ul className="checkbox-list">
                 {REGIONS.map(({ label, value }) => (
                   <li key={value}>
@@ -451,8 +467,7 @@ function App() {
                 aria-pressed={isGeneralMode}
                 onClick={toggleGeneralMode}
               >
-                <span className="general-mode-label-en">General / Any Matching Role</span>
-                <span className="general-mode-label-he">כללי / כל משרה מתאימה</span>
+                General / Any Matching Role
               </button>
 
               {isGeneralMode && (
@@ -576,7 +591,12 @@ function App() {
                     <div className="job-card-header">
                       <h3>{job.title}</h3>
                       {job.matchPercentage != null && (
-                        <span className="match-badge">{job.matchPercentage}% match</span>
+                        <span
+                          className="match-badge"
+                          style={{ color: getMatchPercentageColor(job.matchPercentage) }}
+                        >
+                          {job.matchPercentage}% match
+                        </span>
                       )}
                     </div>
                     <p className="job-company">{job.company}</p>

@@ -2,13 +2,14 @@
 """
 ScouterAI background worker.
 
-1. Fetches pending user_preferences from Turso
+1. Fetches user preferences from Turso (interactive search or UserPreferences for automation)
 2. Scrapes LinkedIn Israel job search results (title × region)
-3. Deduplicates by job URL
-4. Scores each job with OpenAI (gpt-4o-mini) → match_percentage + cover_letter
-5. Saves results to found_jobs in Turso
-6. Sends Discord webhook notifications
-7. Optionally notifies the Node backend via POST /api/callback (SSE to frontend)
+3. Filters jobs to a rolling 14-day publication window
+4. Deduplicates by job URL
+5. Scores each job with OpenAI (gpt-4o-mini) → match_percentage + cover_letter
+6. Saves results to found_jobs in Turso
+7. Sends Discord webhook notifications (deduped via SentJobs)
+8. Optionally notifies the Node backend via POST /api/callback (SSE to frontend)
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import random
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,9 @@ GENERAL_JOB_TITLES = [
     "Junior Developer",
 ]
 
+LATEST_PREFERENCE_ID = "latest"
+ROLLING_WINDOW_DAYS = 14
+
 
 def get_db() -> libsql_client.Client:
     if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
@@ -88,6 +93,48 @@ def get_db() -> libsql_client.Client:
         url=TURSO_DATABASE_URL,
         auth_token=TURSO_AUTH_TOKEN,
     )
+
+
+def ensure_schema(db: libsql_client.Client) -> None:
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS SentJobs (
+            apply_link TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS UserPreferences (
+            id TEXT PRIMARY KEY DEFAULT 'latest',
+            regions TEXT NOT NULL DEFAULT '[]',
+            job_scopes TEXT NOT NULL DEFAULT '[]',
+            job_titles TEXT NOT NULL DEFAULT '[]',
+            max_date_published TEXT,
+            resume_text TEXT,
+            resume_file_name TEXT,
+            search_mode TEXT NOT NULL DEFAULT 'specific',
+            jsearch_query TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+
+def rolling_date_limit() -> str:
+    """Earliest ISO date (YYYY-MM-DD) included in the rolling search window."""
+    cutoff = datetime.now() - timedelta(days=ROLLING_WINDOW_DAYS)
+    return cutoff.date().isoformat()
+
+
+def effective_min_date(user_max_date_published: str | None) -> str:
+    """Use the stricter of the user's filter and the rolling 14-day window."""
+    rolling_min = rolling_date_limit()
+    user_min = (user_max_date_published or "").strip()
+    if user_min and user_min[:10] > rolling_min:
+        return user_min[:10]
+    return rolling_min
 
 
 def parse_json_list(value: Any) -> list[str]:
@@ -167,6 +214,21 @@ def normalize_date_published(value: Any) -> str:
     return text
 
 
+def map_preference_row(row: tuple) -> dict:
+    return {
+        "id": row[0],
+        "regions": parse_json_list(row[1]),
+        "job_scopes": parse_json_list(row[2]),
+        "job_titles": parse_json_list(row[3]),
+        "max_date_published": row[4],
+        "resume_text": row[5] or CV_TEXT,
+        "resume_file_name": row[6],
+        "search_mode": row[7] or "specific",
+        "jsearch_query": row[8],
+        "status": row[9] if len(row) > 9 else "saved",
+    }
+
+
 def fetch_user_preferences(db: libsql_client.Client, preference_id: str | None = None) -> list[dict]:
     sql = """
         SELECT
@@ -192,23 +254,33 @@ def fetch_user_preferences(db: libsql_client.Client, preference_id: str | None =
 
     result = db.execute(sql, args)
 
-    rows = []
-    for row in result.rows:
-        rows.append(
-            {
-                "id": row[0],
-                "regions": parse_json_list(row[1]),
-                "job_scopes": parse_json_list(row[2]),
-                "job_titles": parse_json_list(row[3]),
-                "max_date_published": row[4],
-                "resume_text": row[5] or CV_TEXT,
-                "resume_file_name": row[6],
-                "search_mode": row[7] or "specific",
-                "jsearch_query": row[8],
-                "status": row[9],
-            }
-        )
-    return rows
+    return [map_preference_row(row) for row in result.rows]
+
+
+def fetch_latest_user_preferences(db: libsql_client.Client) -> dict | None:
+    """Load persisted latest preferences for automated runs (GitHub Actions)."""
+    result = db.execute(
+        """
+        SELECT
+            id,
+            regions,
+            job_scopes,
+            job_titles,
+            max_date_published,
+            resume_text,
+            resume_file_name,
+            search_mode,
+            jsearch_query,
+            'saved'
+        FROM UserPreferences
+        WHERE id = ?
+        LIMIT 1
+        """,
+        [LATEST_PREFERENCE_ID],
+    )
+    if not result.rows:
+        return None
+    return map_preference_row(result.rows[0])
 
 
 def update_preference_status(db: libsql_client.Client, preference_id: str, status: str) -> None:
@@ -427,22 +499,41 @@ def scrape_jobs(job_title: str, location: str) -> list[dict]:
         return []
 
 
-def job_matches_max_date(job: dict, max_date_published: str | None) -> bool:
-    min_date = (max_date_published or "").strip()
-    if not min_date:
-        return True
-
+def job_within_date_window(job: dict, user_max_date_published: str | None) -> bool:
+    min_date = effective_min_date(user_max_date_published)
     published = (job.get("date_published") or "").strip()
+
     if not published:
         return True
 
     return published[:10] >= min_date[:10]
 
 
+def claim_notification_slot(db: libsql_client.Client, apply_link: str) -> bool:
+    """
+    Insert apply link into SentJobs. Returns True only for first-time links.
+    """
+    apply_link = (apply_link or "").strip()
+    if not apply_link:
+        return False
+
+    result = db.execute(
+        "INSERT OR IGNORE INTO SentJobs (apply_link) VALUES (?)",
+        [apply_link],
+    )
+    return result.rows_affected > 0
+
+
 def collect_unique_jobs(preferences: dict) -> list[dict]:
     titles = resolve_job_titles(preferences["job_titles"], preferences["search_mode"])
     search_locations = resolve_search_regions(preferences.get("regions") or [])
-    max_date_published = preferences.get("max_date_published")
+    user_max_date = preferences.get("max_date_published")
+    min_date = effective_min_date(user_max_date)
+
+    print(
+        f"[Scraper] Date window — rolling {ROLLING_WINDOW_DAYS} days "
+        f"(min={min_date!r}, user filter={user_max_date or 'none'})"
+    )
 
     if not titles:
         print("[Scraper] No job titles to search")
@@ -462,10 +553,10 @@ def collect_unique_jobs(preferences: dict) -> list[dict]:
 
         kept = 0
         for job in batch:
-            if not job_matches_max_date(job, max_date_published):
+            if not job_within_date_window(job, user_max_date):
                 print(
                     f"[Scraper] Filtered out — date={job.get('date_published')!r} "
-                    f"(min={max_date_published!r})"
+                    f"(min={min_date!r})"
                 )
                 continue
 
@@ -673,12 +764,20 @@ def notify_backend_callback(preference_id: str, jobs: list[dict]) -> None:
         print(f"[Backend] Callback failed: {error}")
 
 
-def process_preference(db: libsql_client.Client, preferences: dict) -> None:
+def process_preference(
+    db: libsql_client.Client,
+    preferences: dict,
+    *,
+    interactive: bool = True,
+) -> None:
     preference_id = preferences["id"]
     cv_text = preferences.get("resume_text") or CV_TEXT
 
-    print(f"[Worker] Processing preference {preference_id}")
-    update_preference_status(db, preference_id, "processing")
+    mode_label = "interactive" if interactive else "automated"
+    print(f"[Worker] Processing preference {preference_id} ({mode_label})")
+
+    if interactive:
+        update_preference_status(db, preference_id, "processing")
 
     unique_jobs = collect_unique_jobs(preferences)
     analyzed_results: list[dict] = []
@@ -692,7 +791,12 @@ def process_preference(db: libsql_client.Client, preferences: dict) -> None:
             continue
 
         save_found_job(db, preference_id, job, analysis)
-        send_discord_notification(job, analysis)
+
+        apply_link = (job.get("job_url") or "").strip()
+        if claim_notification_slot(db, apply_link):
+            send_discord_notification(job, analysis)
+        else:
+            print(f"[Discord] Skipped duplicate notification — applyLink={apply_link!r}")
 
         analyzed_results.append(
             {
@@ -703,8 +807,10 @@ def process_preference(db: libsql_client.Client, preferences: dict) -> None:
         )
 
     analyzed_results.sort(key=lambda item: item.get("match_percentage", 0), reverse=True)
-    update_preference_status(db, preference_id, "completed")
-    notify_backend_callback(preference_id, analyzed_results)
+
+    if interactive:
+        update_preference_status(db, preference_id, "completed")
+        notify_backend_callback(preference_id, analyzed_results)
 
     print(
         f"[Worker] Completed preference {preference_id} — "
@@ -714,16 +820,35 @@ def process_preference(db: libsql_client.Client, preferences: dict) -> None:
 
 def run_worker(preference_id: str | None = None) -> None:
     db = get_db()
-    preferences_list = fetch_user_preferences(db, preference_id)
+    ensure_schema(db)
 
+    if preference_id:
+        preferences_list = fetch_user_preferences(db, preference_id)
+        if not preferences_list:
+            print(f"[Worker] No preference found for id={preference_id!r}")
+            return
+
+        for preferences in preferences_list:
+            if preferences.get("status") not in (None, "pending", "processing"):
+                continue
+            process_preference(db, preferences, interactive=True)
+        return
+
+    latest = fetch_latest_user_preferences(db)
+    if latest:
+        print("[Worker] Automated run — loaded latest preferences from UserPreferences")
+        process_preference(db, latest, interactive=False)
+        return
+
+    preferences_list = fetch_user_preferences(db, None)
     if not preferences_list:
-        print("[Worker] No pending preferences found")
+        print("[Worker] No pending preferences or UserPreferences (latest) found")
         return
 
     for preferences in preferences_list:
         if preferences.get("status") not in (None, "pending", "processing"):
             continue
-        process_preference(db, preferences)
+        process_preference(db, preferences, interactive=True)
 
 
 if __name__ == "__main__":

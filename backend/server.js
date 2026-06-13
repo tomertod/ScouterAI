@@ -2,15 +2,19 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
+const { spawn } = require('child_process');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const crypto = require('crypto');
 const locations = require('./locations');
-const { saveUserPreferences, getFoundJobsByPreferenceId } = require('./turso');
+const { saveUserPreferences, saveLatestUserPreferences, getFoundJobsByPreferenceId } = require('./turso');
 
 const PORT = 5001;
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const WORKER_SCRIPT_PATH = path.join(PROJECT_ROOT, 'worker.py');
+const PYTHON_BIN = process.env.PYTHON_PATH || 'python3';
 const MAKE_WEBHOOK_URL = 'https://hook.eu1.make.com/6q8qi3jvu9w1nav74h22dklbfunjkfem';
 const MAX_JOBS = 20;
 const MAKE_FETCH_TIMEOUT_MS = 120_000;
@@ -709,6 +713,44 @@ function createSearchJob(searchJobId, filters) {
   });
 }
 
+function spawnWorkerForSearch(searchJobId) {
+  const worker = spawn(PYTHON_BIN, [WORKER_SCRIPT_PATH, searchJobId], {
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const logPrefix = `[Worker:${searchJobId.slice(0, 8)}]`;
+
+  worker.stdout.on('data', (chunk) => {
+    process.stdout.write(`${logPrefix} ${chunk}`);
+  });
+
+  worker.stderr.on('data', (chunk) => {
+    process.stderr.write(`${logPrefix} ${chunk}`);
+  });
+
+  worker.on('error', (error) => {
+    console.error(`[Scout] Failed to start worker for ${searchJobId}:`, error.message);
+    failSearchJob(
+      searchJobId,
+      `Failed to start background worker: ${error.message}`
+    );
+  });
+
+  worker.on('close', (code) => {
+    if (code === 0) {
+      console.log(`[Scout] Worker finished for ${searchJobId}`);
+      return;
+    }
+    console.error(`[Scout] Worker exited for ${searchJobId} with code ${code}`);
+  });
+
+  console.log(
+    `[Scout] Spawned background worker — ${PYTHON_BIN} ${WORKER_SCRIPT_PATH} ${searchJobId}`
+  );
+}
+
 function completeSearchJob(searchJobId, jobs) {
   const entry = searchJobs.get(searchJobId);
   if (!entry || entry.status === 'completed') return false;
@@ -1172,9 +1214,21 @@ app.post('/api/scout', upload.single('resume'), async (req, res) => {
       jsearchQuery,
     });
 
+    await saveLatestUserPreferences({
+      regions: region,
+      jobScopes: jobScope,
+      jobTitles,
+      maxDatePublished,
+      resumeText,
+      resumeFileName: req.file.originalname,
+      searchMode,
+      jsearchQuery,
+    });
+
     console.log(
       `[Scout] Saved user preferences to Turso — searchJobId: ${searchJobId}, resumeText: ${resumeText.length} chars`
     );
+    console.log('[Scout] Updated UserPreferences (latest) for automated worker runs');
   } catch (error) {
     console.error('[Scout] Failed to save preferences to Turso —', error.message);
     failSearchJob(searchJobId, error.message || 'Failed to save search preferences');
@@ -1182,6 +1236,8 @@ app.post('/api/scout', upload.single('resume'), async (req, res) => {
       error: error.message || 'Failed to save search preferences to database',
     });
   }
+
+  spawnWorkerForSearch(searchJobId);
 
   res.status(200).json({
     searchJobId,

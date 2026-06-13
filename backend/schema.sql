@@ -32,3 +32,23 @@ CREATE TABLE IF NOT EXISTS found_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_user_preferences_status ON user_preferences(status);
 CREATE INDEX IF NOT EXISTS idx_found_jobs_preference_id ON found_jobs(preference_id);
+
+-- Tracks Discord notifications already sent (dedupe by apply link)
+CREATE TABLE IF NOT EXISTS SentJobs (
+  apply_link TEXT PRIMARY KEY,
+  sent_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Latest saved search preferences for automated daily worker runs
+CREATE TABLE IF NOT EXISTS UserPreferences (
+  id TEXT PRIMARY KEY DEFAULT 'latest',
+  regions TEXT NOT NULL DEFAULT '[]',
+  job_scopes TEXT NOT NULL DEFAULT '[]',
+  job_titles TEXT NOT NULL DEFAULT '[]',
+  max_date_published TEXT,
+  resume_text TEXT,
+  resume_file_name TEXT,
+  search_mode TEXT NOT NULL DEFAULT 'specific',
+  jsearch_query TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
