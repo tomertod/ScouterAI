@@ -32,6 +32,13 @@ Prerequisites:
 
   Node.js & npm
 
+## System Architecture & Flow
+  ScouterAI utilizes a stateful architecture to ensure efficiency and reliability:
+
+  1. **Persistence Layer:** Uses **Turso (libSQL)** to store user search preferences (`UserPreferences`) and track processed job IDs (`SentJobs`). This ensures the system is state-aware and   prevents duplicate notifications.
+  2. **Execution Engine:** The system employs a non-blocking `child_process` execution model. When a user triggers a search, the Node.js backend offloads the heavy lifting to the Python       `worker.py` script, allowing for immediate frontend responsiveness.
+  3. **Smart Filtering:** The worker calculates a rolling date window, ensuring that all job results are fresh and relevant while respecting the user's defined timeframe.
+
 ### Backend (port 5000)
 
 ```bash
