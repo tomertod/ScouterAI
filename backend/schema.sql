@@ -52,3 +52,15 @@ CREATE TABLE IF NOT EXISTS UserPreferences (
   jsearch_query TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Job queue consumed by the Python worker (pending → processing → completed/failed)
+CREATE TABLE IF NOT EXISTS SearchQueue (
+  id TEXT PRIMARY KEY,
+  preference_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (preference_id) REFERENCES user_preferences(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_queue_status ON SearchQueue(status);

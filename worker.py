@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-ScouterAI background worker.
+ScouterAI manual worker.
 
-1. Fetches user preferences from Turso (interactive search or UserPreferences for automation)
-2. Scrapes LinkedIn Israel job search results (title × region)
-3. Filters jobs to a rolling 14-day publication window
-4. Deduplicates by job URL
-5. Scores each job with OpenAI (gpt-4o-mini) → match_percentage + cover_letter
-6. Saves results to found_jobs in Turso
-7. Sends Discord webhook notifications (deduped via SentJobs)
-8. Optionally notifies the Node backend via POST /api/callback (SSE to frontend)
+Run after submitting a search from the web UI:
+    python worker.py
+
+1. Loads the latest saved preferences from Turso (UserPreferences)
+2. Scrapes LinkedIn / Indeed job listings
+3. Scores each job with OpenAI → match_percentage + cover_letter
+4. Saves results to found_jobs in Turso
+5. Sends Discord webhook notifications (deduped via SentJobs)
 """
 
 from __future__ import annotations
@@ -62,7 +62,8 @@ REGION_LOCATIONS: dict[str, str] = {
 
 LINKEDIN_JOBS_BASE = "https://il.linkedin.com/jobs/search"
 INDEED_JOBS_BASE = "https://il.indeed.com/jobs"
-SCRAPER_RESULTS_LIMIT = 20
+MAX_JOBS = 5
+SCRAPER_RESULTS_LIMIT = MAX_JOBS
 SCRAPER_MIN_DELAY_SEC = 1.0
 SCRAPER_MAX_DELAY_SEC = 3.0
 SCRAPER_TIMEOUT_SEC = 30
@@ -255,6 +256,46 @@ def fetch_user_preferences(db: libsql_client.Client, preference_id: str | None =
     result = db.execute(sql, args)
 
     return [map_preference_row(row) for row in result.rows]
+
+
+def fetch_next_pending_preferences(db: libsql_client.Client) -> dict | None:
+    """Most recent web search waiting for manual worker (excludes 'latest' snapshot row)."""
+    result = db.execute(
+        """
+        SELECT
+            id,
+            regions,
+            job_scopes,
+            job_titles,
+            max_date_published,
+            resume_text,
+            resume_file_name,
+            search_mode,
+            jsearch_query,
+            status
+        FROM user_preferences
+        WHERE status = 'pending' AND id != ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        [LATEST_PREFERENCE_ID],
+    )
+    if not result.rows:
+        return None
+    return map_preference_row(result.rows[0])
+
+
+def finalize_search_results(
+    db: libsql_client.Client,
+    preference_id: str,
+    analyzed_results: list[dict],
+) -> None:
+    """Mark search complete — results live in found_jobs keyed by preference_id."""
+    update_preference_status(db, preference_id, "completed")
+    print(
+        f"[Worker] Saved {len(analyzed_results)} result(s) for search {preference_id} "
+        "(found_jobs + status=completed)"
+    )
 
 
 def fetch_latest_user_preferences(db: libsql_client.Client) -> dict | None:
@@ -568,14 +609,20 @@ def collect_unique_jobs(preferences: dict) -> list[dict]:
             job["search_location"] = location
             unique_jobs.append(job)
             kept += 1
+            if len(unique_jobs) >= MAX_JOBS:
+                break
 
         print(f"[Scraper] Kept {kept}/{len(batch)} result(s) for title={title!r}, location={location!r}")
 
+        if len(unique_jobs) >= MAX_JOBS:
+            print(f"[Scraper] Reached max job cap ({MAX_JOBS}) — stopping collection")
+            break
+
     print(
         f"[Scraper] Collected {len(unique_jobs)} unique job(s) "
-        f"across {len(combinations)} title × region combination(s)"
+        f"(max {MAX_JOBS}) across {len(combinations)} title × region combination(s)"
     )
-    return unique_jobs
+    return unique_jobs[:MAX_JOBS]
 
 
 def analyze_job_with_openai(job: dict, cv_text: str) -> dict:
@@ -779,7 +826,7 @@ def process_preference(
     if interactive:
         update_preference_status(db, preference_id, "processing")
 
-    unique_jobs = collect_unique_jobs(preferences)
+    unique_jobs = collect_unique_jobs(preferences)[:MAX_JOBS]
     analyzed_results: list[dict] = []
 
     for job in unique_jobs:
@@ -807,9 +854,10 @@ def process_preference(
         )
 
     analyzed_results.sort(key=lambda item: item.get("match_percentage", 0), reverse=True)
+    analyzed_results = analyzed_results[:MAX_JOBS]
 
     if interactive:
-        update_preference_status(db, preference_id, "completed")
+        finalize_search_results(db, preference_id, analyzed_results)
         notify_backend_callback(preference_id, analyzed_results)
 
     print(
@@ -818,39 +866,33 @@ def process_preference(
     )
 
 
-def run_worker(preference_id: str | None = None) -> None:
+def run_worker_once() -> None:
+    """Load pending web search (or latest snapshot), run once, then exit."""
     db = get_db()
     ensure_schema(db)
 
-    if preference_id:
-        preferences_list = fetch_user_preferences(db, preference_id)
-        if not preferences_list:
-            print(f"[Worker] No preference found for id={preference_id!r}")
-            return
+    preferences = fetch_next_pending_preferences(db)
+    if preferences:
+        print(
+            f"[Worker] Manual run — processing pending search {preferences['id']}"
+        )
+    else:
+        print("[Worker] No pending search — falling back to UserPreferences (latest)")
+        preferences = fetch_latest_user_preferences(db)
 
-        for preferences in preferences_list:
-            if preferences.get("status") not in (None, "pending", "processing"):
-                continue
-            process_preference(db, preferences, interactive=True)
-        return
+    if not preferences:
+        print("[Worker] No saved preferences. Submit a search from the web UI first.")
+        sys.exit(1)
 
-    latest = fetch_latest_user_preferences(db)
-    if latest:
-        print("[Worker] Automated run — loaded latest preferences from UserPreferences")
-        process_preference(db, latest, interactive=False)
-        return
-
-    preferences_list = fetch_user_preferences(db, None)
-    if not preferences_list:
-        print("[Worker] No pending preferences or UserPreferences (latest) found")
-        return
-
-    for preferences in preferences_list:
-        if preferences.get("status") not in (None, "pending", "processing"):
-            continue
+    try:
         process_preference(db, preferences, interactive=True)
+    except Exception as error:
+        update_preference_status(db, preferences["id"], "failed")
+        print(f"[Worker] Failed: {error}")
+        sys.exit(1)
+
+    print("[Worker] Done.")
 
 
 if __name__ == "__main__":
-    target_id = sys.argv[1] if len(sys.argv) > 1 else None
-    run_worker(target_id)
+    run_worker_once()

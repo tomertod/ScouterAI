@@ -4,7 +4,7 @@ import ScoutCharacter from './ScoutCharacter';
 
 const API_BASE_URL = 'http://localhost:5001';
 const API_SCOUT_URL = `${API_BASE_URL}/api/scout`;
-const SSE_FALLBACK_POLL_MS = 4500;
+const RESULTS_POLL_MS = 2000;
 
 const GENERAL_JOB_TITLE = 'General';
 
@@ -42,6 +42,7 @@ const REGIONS = [
   { label: 'Arava', value: 'arava' },
   { label: 'Eilat', value: 'eilat' },
 ];
+
 const JOB_SCOPES = [
   'Full-time',
   'Part-time',
@@ -52,7 +53,7 @@ const JOB_SCOPES = [
 
 const initialForm = {
   region: [],
-  jobScope: ['Full-time'],
+  jobScope: [],
   maxDatePublished: '',
 };
 
@@ -62,8 +63,7 @@ function getMatchPercentageColor(percentage) {
   return '#FF4136';
 }
 
-function normalizeJobsFromResponse(data) {
-  const raw = data?.jobs ?? data?.mockJobs ?? [];
+function normalizeJobsList(raw) {
   return Array.isArray(raw) ? raw : [];
 }
 
@@ -97,87 +97,16 @@ function downloadCoverLetterAsTxt(job) {
 
 function App() {
   const formRef = useRef(null);
+  const statusRef = useRef(null);
   const [form, setForm] = useState(initialForm);
   const [isGeneralMode, setIsGeneralMode] = useState(false);
   const [jobTitles, setJobTitles] = useState([]);
   const [resumeFile, setResumeFile] = useState(null);
-  const [jobs, setJobs] = useState(null);
-  const [searchStatus, setSearchStatus] = useState('idle');
+  const [isLoading, setIsLoading] = useState(false);
+  const [searchJobId, setSearchJobId] = useState(null);
+  const [jobs, setJobs] = useState([]);
+  const [resultsReady, setResultsReady] = useState(false);
   const [error, setError] = useState('');
-  const [coverLetterModal, setCoverLetterModal] = useState(null);
-  const [copyFeedback, setCopyFeedback] = useState('');
-  const loadingRef = useRef(null);
-  const pollIntervalRef = useRef(null);
-  const eventSourceRef = useRef(null);
-
-  const stopPolling = () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
-  };
-
-  const stopEventStream = () => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
-  };
-
-  const stopSearchTracking = () => {
-    stopPolling();
-    stopEventStream();
-  };
-
-  useEffect(() => () => stopSearchTracking(), []);
-
-  useEffect(() => {
-    if (!coverLetterModal) return undefined;
-
-    const handleKeyDown = (event) => {
-      if (event.key === 'Escape') {
-        setCoverLetterModal(null);
-        setCopyFeedback('');
-      }
-    };
-
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [coverLetterModal]);
-
-  const openCoverLetterModal = (job) => {
-    setCopyFeedback('');
-    setCoverLetterModal({
-      title: job.title,
-      company: job.company,
-      text: getCoverLetterText(job),
-    });
-  };
-
-  const closeCoverLetterModal = () => {
-    setCoverLetterModal(null);
-    setCopyFeedback('');
-  };
-
-  const copyCoverLetterToClipboard = async () => {
-    if (!coverLetterModal?.text) return;
-
-    try {
-      await navigator.clipboard.writeText(coverLetterModal.text);
-      setCopyFeedback('Copied to clipboard');
-    } catch {
-      setCopyFeedback('Copy failed — select the text manually');
-    }
-  };
-
-  const downloadModalCoverLetter = () => {
-    if (!coverLetterModal) return;
-    downloadCoverLetterAsTxt({
-      title: coverLetterModal.title,
-      company: coverLetterModal.company,
-      coverLetter: coverLetterModal.text,
-    });
-  };
 
   const handleChange = (event) => {
     const { name, value } = event.target;
@@ -195,8 +124,7 @@ function App() {
   };
 
   const handleResumeChange = (event) => {
-    const file = event.target.files?.[0] ?? null;
-    setResumeFile(file);
+    setResumeFile(event.target.files?.[0] ?? null);
   };
 
   const toggleGeneralMode = () => {
@@ -224,95 +152,87 @@ function App() {
     setIsGeneralMode(false);
   };
 
-  const applyCompletedSearch = (data) => {
-    stopSearchTracking();
-    setJobs(normalizeJobsFromResponse(data));
-    setSearchStatus('complete');
+  const handleReset = () => {
+    setSearchJobId(null);
+    setJobs([]);
+    setResultsReady(false);
+    setIsLoading(false);
+    setError('');
+    setForm(initialForm);
+    setIsGeneralMode(false);
+    setJobTitles([]);
+    setResumeFile(null);
+    if (formRef.current) {
+      formRef.current.reset();
+    }
   };
 
-  const applyFailedSearch = (message) => {
-    stopSearchTracking();
-    setJobs(null);
-    setSearchStatus('error');
-    setError(message || 'Search failed. Please try again.');
-  };
-
-  const pollSearchStatus = async (searchJobId) => {
-    const response = await fetch(`${API_BASE_URL}/api/search-status/${searchJobId}`);
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(data.error || 'Failed to check search status.');
+  useEffect(() => {
+    if (!searchJobId || !isLoading) {
+      return undefined;
     }
 
-    if (data.status === 'completed') {
-      applyCompletedSearch(data);
-      return data.status;
-    }
+    let cancelled = false;
 
-    if (data.status === 'failed') {
-      applyFailedSearch(data.error);
-      return data.status;
-    }
+    const pollResults = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/results/${searchJobId}`);
+        let data = {};
+        try {
+          data = await response.json();
+        } catch {
+          throw new Error('Invalid response while checking results.');
+        }
 
-    return data.status;
-  };
+        if (!response.ok) {
+          throw new Error(data?.error || 'Failed to load search results.');
+        }
 
-  const startPollingFallback = (searchJobId) => {
-    stopPolling();
-    pollIntervalRef.current = setInterval(() => {
-      pollSearchStatus(searchJobId).catch((pollError) => {
-        applyFailedSearch(pollError.message || 'Failed while checking search status.');
-      });
-    }, SSE_FALLBACK_POLL_MS);
-  };
+        if (cancelled) return;
 
-  const subscribeToSearchEvents = (searchJobId) => {
-    stopEventStream();
+        const status = typeof data?.status === 'string' ? data.status : '';
 
-    const source = new EventSource(
-      `${API_BASE_URL}/api/search-events/${searchJobId}`
-    );
-    eventSourceRef.current = source;
+        if (status === 'completed') {
+          setJobs(normalizeJobsList(data?.jobs));
+          setResultsReady(true);
+          setIsLoading(false);
+          return;
+        }
 
-    source.addEventListener('search-complete', (event) => {
-      const data = JSON.parse(event.data);
-      applyCompletedSearch(data);
-    });
-
-    source.addEventListener('search-failed', (event) => {
-      const data = JSON.parse(event.data);
-      applyFailedSearch(data.error);
-    });
-
-    source.onerror = () => {
-      stopEventStream();
-      pollSearchStatus(searchJobId)
-        .then((status) => {
-          if (status === 'processing') {
-            startPollingFallback(searchJobId);
-          }
-        })
-        .catch((pollError) => {
-          applyFailedSearch(
-            pollError.message || 'Lost connection while waiting for results.'
-          );
-        });
+        if (status === 'failed') {
+          setError('Search failed. Please try again.');
+          setIsLoading(false);
+        }
+      } catch (pollError) {
+        if (!cancelled) {
+          setError(pollError.message || 'Failed while waiting for results.');
+          setIsLoading(false);
+        }
+      }
     };
-  };
+
+    pollResults();
+    const intervalId = setInterval(pollResults, RESULTS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [searchJobId, isLoading]);
 
   const handleSearch = async (event) => {
     event.preventDefault();
     setError('');
+    setResultsReady(false);
+    setJobs([]);
+    setSearchJobId(null);
 
     if (!resumeFile) {
       setError('Please upload your resume (PDF).');
       return;
     }
 
-    const titlesToSubmit = isGeneralMode
-      ? [GENERAL_JOB_TITLE]
-      : [...jobTitles];
+    const titlesToSubmit = isGeneralMode ? [GENERAL_JOB_TITLE] : [...jobTitles];
 
     if (titlesToSubmit.length === 0) {
       setError('Please select General mode or at least one job title.');
@@ -330,13 +250,10 @@ function App() {
     titlesToSubmit.forEach((title) => body.append('jobTitles', title));
     body.append('maxDatePublished', form.maxDatePublished);
 
-    stopSearchTracking();
-    setSearchStatus('loading');
-    setJobs(null);
-    setError('');
+    setIsLoading(true);
 
     requestAnimationFrame(() => {
-      loadingRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      statusRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     });
 
     try {
@@ -345,46 +262,125 @@ function App() {
         body,
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Search failed. Please try again.');
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error('Server returned an invalid response. Is the backend running on port 5001?');
       }
 
-      const searchJobId = data.searchJobId;
-      if (!searchJobId) {
+      if (!response.ok) {
+        throw new Error(
+          typeof data?.error === 'string'
+            ? data.error
+            : 'Search failed. Please try again.'
+        );
+      }
+
+      const id = typeof data?.searchJobId === 'string' ? data.searchJobId.trim() : '';
+      if (!id) {
         throw new Error('Server did not return a searchJobId.');
       }
 
-      subscribeToSearchEvents(searchJobId);
+      setSearchJobId(id);
     } catch (err) {
-      stopSearchTracking();
       setError(err.message || 'Network error. Is the backend running on port 5001?');
-      setJobs(null);
-      setSearchStatus('error');
+      setIsLoading(false);
     }
   };
 
-  const handleReset = () => {
-    stopSearchTracking();
-    closeCoverLetterModal();
-    setJobs(null);
-    setSearchStatus('idle');
-    setError('');
-    setForm(initialForm);
-    setIsGeneralMode(false);
-    setJobTitles([]);
-    setResumeFile(null);
-    if (formRef.current) {
-      formRef.current.reset();
-      formRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      formRef.current.querySelector('input[type="file"]')?.focus();
+  const renderStatusSection = () => {
+    if (isLoading) {
+      return (
+        <section
+          ref={statusRef}
+          className="panel loading-panel"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <p className="loading-title">Searching... (This may take up to a minute)</p>
+          <p className="loading-subtitle">
+            Run <code>python worker.py</code> in your terminal to process this search.
+          </p>
+        </section>
+      );
     }
-  };
 
-  const isLoading = searchStatus === 'loading';
-  const showResults = searchStatus === 'complete' && jobs !== null;
-  const showLoading = isLoading;
+    if (resultsReady && Array.isArray(jobs)) {
+      return (
+        <section className="panel results-panel" aria-label="Search results">
+          <h2>
+            {jobs.length} match{jobs.length !== 1 ? 'es' : ''} found
+          </h2>
+
+          {jobs.length === 0 ? (
+            <p>No jobs matched your filters. Try different options.</p>
+          ) : (
+            <ul className="job-list">
+              {Array.isArray(jobs) &&
+                jobs.map((job, index) => (
+                  <li key={job?.id ?? `job-${index}`} className="job-card">
+                    <div className="job-card-header">
+                      <h3>{job?.title ?? 'Untitled role'}</h3>
+                      {job?.matchPercentage != null && (
+                        <span
+                          className="match-badge"
+                          style={{ color: getMatchPercentageColor(job.matchPercentage) }}
+                        >
+                          {job.matchPercentage}% match
+                        </span>
+                      )}
+                    </div>
+                    <p className="job-company">{job?.company ?? ''}</p>
+                    <dl className="job-meta">
+                      {job?.location && (
+                        <div>
+                          <dt>Location</dt>
+                          <dd>{job.location}</dd>
+                        </div>
+                      )}
+                      {job?.datePublished && (
+                        <div>
+                          <dt>Date published</dt>
+                          <dd>{job.datePublished}</dd>
+                        </div>
+                      )}
+                    </dl>
+                    <div className="job-actions">
+                      {job?.applyLink && (
+                        <a
+                          className="btn-primary btn-apply"
+                          href={job.applyLink}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Apply for Job
+                        </a>
+                      )}
+                      {getCoverLetterText(job) && (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => downloadCoverLetterAsTxt(job)}
+                        >
+                          Download Cover Letter
+                        </button>
+                      )}
+                    </div>
+                  </li>
+                ))}
+            </ul>
+          )}
+
+          <button type="button" className="btn-link" onClick={handleReset}>
+            Change options and try again
+          </button>
+        </section>
+      );
+    }
+
+    return null;
+  };
 
   return (
     <div className="app">
@@ -458,7 +454,7 @@ function App() {
             <fieldset className="field job-titles-field">
               <legend>Job titles</legend>
               <p className="field-hint">
-                Choose specific roles or use General to search broadly for entry-level and student positions matching your resume.
+                Choose specific roles or use General to search broadly.
               </p>
 
               <button
@@ -469,12 +465,6 @@ function App() {
               >
                 General / Any Matching Role
               </button>
-
-              {isGeneralMode && (
-                <p className="general-mode-note" role="status">
-                  Broad search enabled — JSearch will pull varied technical roles; AI will match against your resume skills.
-                </p>
-              )}
 
               <ul className="title-preset-grid" aria-label="Preset job titles">
                 {PRESET_JOB_TITLES.map((title) => {
@@ -545,178 +535,13 @@ function App() {
             )}
 
             <button type="submit" className="btn-primary" disabled={isLoading}>
-              {isLoading ? 'Analyzing jobs…' : 'Search'}
+              {isLoading ? 'Searching…' : 'Search'}
             </button>
           </form>
         </section>
 
-        {showLoading && (
-          <section
-            ref={loadingRef}
-            className="panel loading-panel"
-            aria-live="polite"
-            aria-busy="true"
-          >
-            <div className="loading-indicator">
-              <span className="loading-spinner" aria-hidden="true" />
-              <div>
-                <p className="loading-title">
-                  Scanning the web and analyzing jobs with ScouterAI…
-                </p>
-                <p className="loading-subtitle">
-                  This may take up to a minute while we search job boards and run Gemini matching against your resume.
-                </p>
-                <ul className="loading-steps">
-                  <li>Querying JSearch with your filters</li>
-                  <li>Running AI match scoring on each listing</li>
-                  <li>Preparing your personalized results</li>
-                </ul>
-              </div>
-            </div>
-          </section>
-        )}
-
-        {showResults && (
-          <section className="panel results-panel" aria-label="Search results">
-            <h2>
-              {jobs.length} match{jobs.length !== 1 ? 'es' : ''} found
-            </h2>
-
-            {jobs.length === 0 ? (
-              <p>No jobs matched your filters. Try different options.</p>
-            ) : (
-              <ul className="job-list">
-                {jobs.map((job) => (
-                  <li key={job.id} className="job-card">
-                    <div className="job-card-header">
-                      <h3>{job.title}</h3>
-                      {job.matchPercentage != null && (
-                        <span
-                          className="match-badge"
-                          style={{ color: getMatchPercentageColor(job.matchPercentage) }}
-                        >
-                          {job.matchPercentage}% match
-                        </span>
-                      )}
-                    </div>
-                    <p className="job-company">{job.company}</p>
-                    <dl className="job-meta">
-                      {job.datePublished && (
-                        <div>
-                          <dt>Date published</dt>
-                          <dd>{job.datePublished}</dd>
-                        </div>
-                      )}
-                      {job.jobScope && (
-                        <div>
-                          <dt>Job scope</dt>
-                          <dd>{job.jobScope}</dd>
-                        </div>
-                      )}
-                      {job.location && (
-                        <div>
-                          <dt>Location</dt>
-                          <dd>{job.location}</dd>
-                        </div>
-                      )}
-                    </dl>
-                    <div className="job-actions">
-                      {job.applyLink && (
-                        <a
-                          className="btn-primary btn-apply"
-                          href={job.applyLink}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          Apply for Job
-                        </a>
-                      )}
-                      {job.coverLetterUrl && (
-                        <a
-                          className="btn-secondary"
-                          href={job.coverLetterUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          Download Cover Letter
-                        </a>
-                      )}
-                      {!job.coverLetterUrl && getCoverLetterText(job) && (
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => openCoverLetterModal(job)}
-                        >
-                          Download Cover Letter
-                        </button>
-                      )}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-
-            <button type="button" className="btn-link" onClick={handleReset}>
-              Change options and try again
-            </button>
-          </section>
-        )}
+        {renderStatusSection()}
       </main>
-
-      {coverLetterModal && (
-        <div
-          className="modal-overlay"
-          role="presentation"
-          onClick={closeCoverLetterModal}
-        >
-          <div
-            className="modal-panel cover-letter-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="cover-letter-modal-title"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="modal-header">
-              <div>
-                <h2 id="cover-letter-modal-title">Cover letter</h2>
-                <p className="modal-subtitle">
-                  {coverLetterModal.title}
-                  {coverLetterModal.company ? ` · ${coverLetterModal.company}` : ''}
-                </p>
-              </div>
-              <button
-                type="button"
-                className="modal-close"
-                onClick={closeCoverLetterModal}
-                aria-label="Close cover letter"
-              >
-                ×
-              </button>
-            </div>
-
-            <textarea
-              className="cover-letter-text"
-              readOnly
-              value={coverLetterModal.text}
-              aria-label="Cover letter text"
-            />
-
-            <div className="modal-actions">
-              <button type="button" className="btn-primary" onClick={downloadModalCoverLetter}>
-                Download .txt
-              </button>
-              <button type="button" className="btn-secondary" onClick={copyCoverLetterToClipboard}>
-                Copy to clipboard
-              </button>
-              {copyFeedback && (
-                <span className="copy-feedback" role="status">
-                  {copyFeedback}
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

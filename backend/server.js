@@ -1,22 +1,39 @@
+const fs = require('fs');
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const crypto = require('crypto');
 const locations = require('./locations');
-const { saveUserPreferences, saveLatestUserPreferences, getFoundJobsByPreferenceId } = require('./turso');
+const { saveUserPreferences, saveLatestUserPreferences, getFoundJobsByPreferenceId, getSearchResults } = require('./turso');
 
 const PORT = 5001;
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const WORKER_SCRIPT_PATH = path.join(PROJECT_ROOT, 'worker.py');
-const PYTHON_BIN = process.env.PYTHON_PATH || 'python3';
+
+function resolvePythonBin() {
+  if (process.env.PYTHON_PATH) {
+    return process.env.PYTHON_PATH;
+  }
+  if (process.platform === 'win32') {
+    return 'python';
+  }
+  try {
+    const resolved = execSync('which python3', { encoding: 'utf8' }).trim();
+    return resolved.split(/\r?\n/)[0] || 'python3';
+  } catch {
+    return 'python3';
+  }
+}
+
+const PYTHON_BIN = resolvePythonBin();
 const MAKE_WEBHOOK_URL = 'https://hook.eu1.make.com/6q8qi3jvu9w1nav74h22dklbfunjkfem';
-const MAX_JOBS = 20;
+const MAX_JOBS = 5;
 const MAKE_FETCH_TIMEOUT_MS = 120_000;
 const SEARCH_JOB_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -706,49 +723,93 @@ function finalizeJobsFromMakeResponse(data, maxDatePublished) {
 
 function createSearchJob(searchJobId, filters) {
   searchJobs.set(searchJobId, {
-    status: 'processing',
+    status: 'pending',
     jobs: [],
     filters,
     createdAt: new Date().toISOString(),
   });
 }
 
+function buildWorkerEnv() {
+  return {
+    ...process.env,
+    TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL,
+    TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL,
+    BACKEND_CALLBACK_URL:
+      process.env.BACKEND_CALLBACK_URL || `http://localhost:${PORT}/api/callback`,
+  };
+}
+
 function spawnWorkerForSearch(searchJobId) {
-  const worker = spawn(PYTHON_BIN, [WORKER_SCRIPT_PATH, searchJobId], {
+  if (!searchJobId) {
+    console.error('[Scout] Cannot spawn worker — missing searchJobId');
+    return;
+  }
+
+  if (!fs.existsSync(WORKER_SCRIPT_PATH)) {
+    const message = `worker.py not found at ${WORKER_SCRIPT_PATH}`;
+    console.error(`[Scout] ${message}`);
+    failSearchJob(searchJobId, message);
+    return;
+  }
+
+  const workerEnv = buildWorkerEnv();
+  const workerArgs = [WORKER_SCRIPT_PATH, searchJobId];
+
+  console.log('[Scout] Triggering background worker with:');
+  console.log(`  python: ${PYTHON_BIN}`);
+  console.log(`  script: ${WORKER_SCRIPT_PATH}`);
+  console.log(`  cwd:    ${PROJECT_ROOT}`);
+  console.log(`  args:   ${workerArgs.join(' ')}`);
+
+  const worker = spawn(PYTHON_BIN, workerArgs, {
     cwd: PROJECT_ROOT,
-    env: process.env,
+    env: workerEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: false,
+    shell: false,
   });
 
   const logPrefix = `[Worker:${searchJobId.slice(0, 8)}]`;
 
+  worker.on('spawn', () => {
+    console.log(
+      `[Scout] Worker process successfully triggered — pid ${worker.pid}, searchJobId: ${searchJobId}`
+    );
+  });
+
   worker.stdout.on('data', (chunk) => {
-    process.stdout.write(`${logPrefix} ${chunk}`);
+    const text = chunk.toString();
+    console.log(`${logPrefix} [stdout] ${text.trimEnd()}`);
   });
 
   worker.stderr.on('data', (chunk) => {
-    process.stderr.write(`${logPrefix} ${chunk}`);
+    const text = chunk.toString();
+    console.error(`${logPrefix} [stderr] ${text.trimEnd()}`);
   });
 
   worker.on('error', (error) => {
-    console.error(`[Scout] Failed to start worker for ${searchJobId}:`, error.message);
+    console.error(
+      `[Scout] Failed to start worker for ${searchJobId}:`,
+      error.message
+    );
     failSearchJob(
       searchJobId,
       `Failed to start background worker: ${error.message}`
     );
   });
 
-  worker.on('close', (code) => {
+  worker.on('close', (code, signal) => {
     if (code === 0) {
-      console.log(`[Scout] Worker finished for ${searchJobId}`);
+      console.log(`[Scout] Worker finished for ${searchJobId} (exit code 0)`);
       return;
     }
-    console.error(`[Scout] Worker exited for ${searchJobId} with code ${code}`);
+    console.error(
+      `[Scout] Worker exited for ${searchJobId} — code ${code ?? 'null'}, signal ${signal ?? 'null'}`
+    );
   });
-
-  console.log(
-    `[Scout] Spawned background worker — ${PYTHON_BIN} ${WORKER_SCRIPT_PATH} ${searchJobId}`
-  );
 }
 
 function completeSearchJob(searchJobId, jobs) {
@@ -793,7 +854,7 @@ function getSearchJobStatus(searchJobId) {
   if (!entry) return null;
 
   if (
-    entry.status === 'processing' &&
+    (entry.status === 'pending' || entry.status === 'processing') &&
     Date.now() - new Date(entry.createdAt).getTime() > SEARCH_JOB_TIMEOUT_MS
   ) {
     failSearchJob(
@@ -1135,9 +1196,28 @@ app.get('/api/search-status/:searchJobId', async (req, res) => {
   }
 
   return res.json({
-    status: 'processing',
+    status: entry.status === 'processing' ? 'processing' : 'pending',
     searchJobId,
   });
+});
+
+app.get('/api/results/:searchJobId', async (req, res) => {
+  const { searchJobId } = req.params;
+
+  try {
+    const results = await getSearchResults(searchJobId);
+
+    if (!results) {
+      return res.status(404).json({ error: 'Search not found' });
+    }
+
+    return res.json(results);
+  } catch (error) {
+    console.error('[Scout] Failed to load search results —', error.message);
+    return res.status(500).json({
+      error: error.message || 'Failed to load search results',
+    });
+  }
 });
 
 app.post('/api/scout', upload.single('resume'), async (req, res) => {
@@ -1188,20 +1268,12 @@ app.post('/api/scout', upload.single('resume'), async (req, res) => {
     resumeText = '';
   }
 
-  const formFields = { region, jobScope, jobTitles, maxDatePublished };
-  const searchJobId = crypto.randomUUID();
   const searchMode = isGeneralJobSearch(jobTitles) ? 'general' : 'specific';
   const jsearchQuery = buildJSearchQuery({ jobTitles, regions: region });
 
-  createSearchJob(searchJobId, {
-    region,
-    jobScope,
-    jobTitles,
-    maxDatePublished,
-    resumeFileName: req.file.originalname,
-  });
-
   try {
+    const searchJobId = crypto.randomUUID();
+
     await saveUserPreferences({
       searchJobId,
       regions: region,
@@ -1228,21 +1300,15 @@ app.post('/api/scout', upload.single('resume'), async (req, res) => {
     console.log(
       `[Scout] Saved user preferences to Turso — searchJobId: ${searchJobId}, resumeText: ${resumeText.length} chars`
     );
-    console.log('[Scout] Updated UserPreferences (latest) for automated worker runs');
+    console.log('[Scout] Updated UserPreferences (latest) for manual worker runs');
+
+    return res.status(200).json({ message: 'Search triggered', searchJobId });
   } catch (error) {
     console.error('[Scout] Failed to save preferences to Turso —', error.message);
-    failSearchJob(searchJobId, error.message || 'Failed to save search preferences');
     return res.status(500).json({
       error: error.message || 'Failed to save search preferences to database',
     });
   }
-
-  spawnWorkerForSearch(searchJobId);
-
-  res.status(200).json({
-    searchJobId,
-    status: 'processing',
-  });
 });
 
 app.use((err, _req, res, _next) => {
@@ -1257,6 +1323,9 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`ScouterAI API listening on http://localhost:${PORT}`);
+  console.log(`[Worker] Python binary: ${PYTHON_BIN}`);
+  console.log(`[Worker] Script path: ${WORKER_SCRIPT_PATH}`);
+  console.log(`[Worker] Project root (cwd): ${PROJECT_ROOT}`);
   console.log(
     `[Locations] Loaded ${Object.keys(locations).length} settlement mappings across 8 region codes`
   );

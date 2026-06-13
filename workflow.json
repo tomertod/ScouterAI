@@ -1,0 +1,192 @@
+{
+  "workflow_name": "ScouterAI Job Search Pipeline",
+  "version": "1.1.0",
+  "description": "Manual-trigger job search pipeline: React frontend submits preferences, Express persists them to Turso with a pending status, a Python worker picks up pending records, scrapes LinkedIn and Indeed, analyzes matches with OpenAI, and delivers results to Discord and the web UI.",
+  "execution_mode": "manual_trigger",
+  "repository": "Quest2",
+  "steps": [
+    {
+      "step": 1,
+      "id": "frontend_user_input",
+      "name": "Frontend User Input",
+      "description": "The user fills out the search form in the React app and clicks Search. The frontend sends a multipart POST with resume PDF, regions, job scopes, job titles, and an optional max date filter.",
+      "component": "frontend/src/App.js",
+      "technology": "React",
+      "trigger": "User clicks Search",
+      "inputs": [
+        "resume (PDF file)",
+        "region[] (checkbox values)",
+        "jobScope[] (checkbox values)",
+        "jobTitles[] (preset chips or General mode)",
+        "maxDatePublished (optional date)"
+      ],
+      "outputs": [
+        "POST /api/scout (multipart/form-data)"
+      ],
+      "endpoint": "POST /api/scout"
+    },
+    {
+      "step": 2,
+      "id": "database_persistence",
+      "name": "Database Persistence",
+      "description": "The Express backend validates the request, extracts and summarizes resume text from the PDF, generates a UUID searchJobId, and writes two Turso records: a per-search row in user_preferences and a snapshot in UserPreferences (id = latest) for the worker fallback path.",
+      "component": "backend/server.js, backend/turso.js",
+      "technology": "Node.js, Express, pdf-parse, Turso (@libsql/client)",
+      "trigger": "POST /api/scout received",
+      "inputs": [
+        "form fields from multipart body",
+        "resume PDF buffer",
+        "searchJobId (crypto.randomUUID())"
+      ],
+      "outputs": [
+        "user_preferences row: id = searchJobId, status = pending",
+        "UserPreferences row: id = latest (upsert)",
+        "HTTP 200: { message: 'Search triggered', searchJobId }"
+      ],
+      "tables": [
+        "user_preferences",
+        "UserPreferences"
+      ],
+      "functions": [
+        "saveUserPreferences",
+        "saveLatestUserPreferences"
+      ]
+    },
+    {
+      "step": 3,
+      "id": "pending_job_registration",
+      "name": "Pending Job Registration",
+      "description": "There is no separate SearchQueue table in the active flow. Queueing is implemented by setting user_preferences.status to 'pending' at insert time. This pending row is the work item the Python worker looks for. The frontend stores searchJobId and begins polling GET /api/results/:searchJobId every 2 seconds while waiting.",
+      "component": "backend/turso.js, frontend/src/App.js",
+      "technology": "Turso (libSQL), React (useEffect polling)",
+      "trigger": "saveUserPreferences completes successfully",
+      "inputs": [
+        "searchJobId (UUID)"
+      ],
+      "outputs": [
+        "user_preferences.status = 'pending'",
+        "Frontend: isLoading = true, poll /api/results/:searchJobId every 2000ms"
+      ],
+      "tables": [
+        "user_preferences"
+      ],
+      "status_lifecycle": [
+        "pending",
+        "processing",
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "step": 4,
+      "id": "worker_orchestration",
+      "name": "Worker Orchestration",
+      "description": "The operator manually runs `python worker.py`. On each invocation the worker queries user_preferences for the most recent row where status = 'pending' and id != 'latest' (fetch_next_pending_preferences). If none exists, it falls back to UserPreferences (latest). It sets status to 'processing', runs scrape + analysis, then sets status to 'completed' via finalize_search_results. The worker exits after one run.",
+      "component": "worker.py",
+      "technology": "Python 3, libsql-client",
+      "trigger": "Operator runs: python worker.py",
+      "inputs": [
+        "TURSO_DATABASE_URL",
+        "TURSO_AUTH_TOKEN",
+        "pending user_preferences row"
+      ],
+      "outputs": [
+        "user_preferences.status: pending → processing → completed",
+        "found_jobs rows keyed by preference_id (= searchJobId)",
+        "Optional POST to BACKEND_CALLBACK_URL (/api/callback)"
+      ],
+      "tables": [
+        "user_preferences",
+        "found_jobs"
+      ],
+      "functions": [
+        "run_worker_once",
+        "fetch_next_pending_preferences",
+        "process_preference",
+        "update_preference_status",
+        "finalize_search_results"
+      ]
+    },
+    {
+      "step": 5,
+      "id": "scraping_and_ai_analysis",
+      "name": "Scraping and AI Analysis",
+      "description": "For each job title × region combination, the worker scrapes LinkedIn (il.linkedin.com/jobs/search) and Indeed (il.indeed.com/jobs) using requests and BeautifulSoup. Results are filtered by a rolling 14-day date window, deduplicated by job URL, and capped at 5 jobs (MAX_JOBS). Each job is analyzed by the OpenAI API (gpt-4o-mini, JSON response) to produce match_percentage and a tailored cover_letter. Results are saved to found_jobs.",
+      "component": "worker.py",
+      "technology": "requests, BeautifulSoup, OpenAI Python SDK (gpt-4o-mini)",
+      "trigger": "process_preference starts after pending row is claimed",
+      "inputs": [
+        "job_titles, regions, resume_text from user_preferences",
+        "scraped HTML from LinkedIn and Indeed"
+      ],
+      "outputs": [
+        "found_jobs: title, company, location, job_url, match_percentage, cover_letter",
+        "Up to 5 analyzed jobs per run"
+      ],
+      "limits": {
+        "max_jobs_per_run": 5,
+        "rolling_date_window_days": 14,
+        "scraper_per_page_limit": 5
+      },
+      "functions": [
+        "collect_unique_jobs",
+        "scrape_jobs",
+        "parse_linkedin_html",
+        "parse_indeed_html",
+        "analyze_job_with_openai",
+        "save_found_job"
+      ],
+      "ai_provider": "OpenAI (not Gemini)"
+    },
+    {
+      "step": 6,
+      "id": "delivery",
+      "name": "Delivery",
+      "description": "After analysis, the worker sends Discord webhook embeds for each new job (deduplicated via SentJobs by apply_link), optionally POSTs results to /api/callback, and marks the search completed. The frontend polling on GET /api/results/:searchJobId receives status = 'completed' and a jobs array from found_jobs, then renders job cards with Apply links and Download Cover Letter buttons.",
+      "component": "worker.py, backend/server.js, backend/turso.js, frontend/src/App.js",
+      "technology": "Discord Webhooks, Express REST, React",
+      "trigger": "finalize_search_results sets status to completed",
+      "inputs": [
+        "analyzed_results",
+        "searchJobId (preference_id)"
+      ],
+      "outputs": [
+        "Discord embed notifications (title, company, match %, apply link, cover letter)",
+        "found_jobs persisted in Turso",
+        "GET /api/results/:searchJobId → { searchJobId, status, jobs[] }",
+        "Frontend job list with Apply for Job + Download Cover Letter"
+      ],
+      "tables": [
+        "found_jobs",
+        "SentJobs",
+        "user_preferences"
+      ],
+      "endpoints": [
+        "GET /api/results/:searchJobId",
+        "POST /api/callback"
+      ],
+      "functions": [
+        "send_discord_notification",
+        "claim_notification_slot",
+        "getSearchResults",
+        "getFoundJobsByPreferenceId"
+      ]
+    }
+  ],
+  "data_flow_summary": [
+    "User → React App → POST /api/scout",
+    "Express → Turso user_preferences (status = pending) + UserPreferences (latest)",
+    "React → poll GET /api/results/:searchJobId every 2s",
+    "Operator → python worker.py → SELECT pending FROM user_preferences",
+    "Worker → scrape LinkedIn + Indeed → OpenAI analyze → INSERT found_jobs",
+    "Worker → Discord notifications + status = completed",
+    "React → receives jobs[] → renders results"
+  ],
+  "environment_variables": [
+    "TURSO_DATABASE_URL",
+    "TURSO_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "DISCORD_WEBHOOK_URL",
+    "BACKEND_CALLBACK_URL"
+  ]
+}
